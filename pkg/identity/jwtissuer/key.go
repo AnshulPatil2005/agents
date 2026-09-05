@@ -48,8 +48,12 @@ func LoadSigningKey(pemData []byte) (SigningKey, error) {
 
 // LoadSigningKeyFromFile reads a PEM-encoded private key from disk, for the
 // common case of a Secret projected into the pod as a volume.
+//
+// The path is operator configuration naming a mount inside the pod, not a value
+// any request can influence, so reading it through a variable is the intended
+// behaviour rather than a traversal risk.
 func LoadSigningKeyFromFile(path string) (SigningKey, error) {
-	pemData, err := os.ReadFile(path)
+	pemData, err := os.ReadFile(path) // #nosec G304 -- operator-configured key mount path
 	if err != nil {
 		return SigningKey{}, fmt.Errorf("read signing key: %w", err)
 	}
