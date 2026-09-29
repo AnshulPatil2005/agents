@@ -44,11 +44,11 @@ type JWTAuthentication struct {
 
 // AgentAuthenticationConfigSpec declares a trusted end-user identity provider.
 type AgentAuthenticationConfigSpec struct {
-	// Type selects how an issuer proves an end-user identity. Only JWT is
-	// supported: an OIDC ID token validated against a discovered issuer and
-	// JWKS.
+	// Type selects how an issuer proves an end-user identity. The only
+	// supported value is "jwt": an OIDC ID token validated against a
+	// discovered issuer and JWKS.
 	// +kubebuilder:validation:Required
-	// +kubebuilder:validation:Enum=JWT
+	// +kubebuilder:validation:Enum=jwt
 	Type string `json:"type"`
 
 	// JWT configures the trusted OIDC issuer. Required when Type is JWT.

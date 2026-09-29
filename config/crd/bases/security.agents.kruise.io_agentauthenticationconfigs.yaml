@@ -82,11 +82,11 @@ spec:
                 type: object
               type:
                 description: |-
-                  Type selects how an issuer proves an end-user identity. Only JWT is
-                  supported: an OIDC ID token validated against a discovered issuer and
-                  JWKS.
+                  Type selects how an issuer proves an end-user identity. The only
+                  supported value is "jwt": an OIDC ID token validated against a
+                  discovered issuer and JWKS.
                 enum:
-                - JWT
+                - jwt
                 type: string
             required:
             - type
