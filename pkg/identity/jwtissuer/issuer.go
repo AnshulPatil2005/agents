@@ -165,7 +165,13 @@ func (i *Issuer) validateRetainedKeys() error {
 // IssueTrafficAccessToken mints a token binding subject to a single sandbox and
 // returns it alongside its expiry, so callers can record the expiry without
 // parsing the token back.
-func (i *Issuer) IssueTrafficAccessToken(subject string, binding SandboxBinding) (string, time.Time, error) {
+//
+// validity overrides the issuer's default lifetime for this token; zero uses the
+// default. The caller resolves validity as policy per request, so it cannot be
+// fixed at construction: sandbox-manager normalizes TokenOptions.RequestedValidity
+// before issuance and the value is not client-controlled.
+func (i *Issuer) IssueTrafficAccessToken(subject string, binding SandboxBinding,
+	validity time.Duration) (string, time.Time, error) {
 	if subject == "" {
 		return "", time.Time{}, fmt.Errorf("subject must not be empty")
 	}
@@ -191,8 +197,12 @@ func (i *Issuer) IssueTrafficAccessToken(subject string, binding SandboxBinding)
 	// The verifier requires exp, iat and nbf to all be present. nbf is set equal
 	// to iat rather than backdated: oidc.DefaultClockSkew is one minute, so a
 	// replica running slightly ahead of a gateway does not trip nbf.
+	if validity <= 0 {
+		validity = i.lifetime
+	}
+
 	issuedAt := i.now()
-	expiry := issuedAt.Add(i.lifetime)
+	expiry := issuedAt.Add(validity)
 	claims := trafficAccessTokenClaims{
 		Claims: jwt.Claims{
 			Issuer:    i.issuerURL,

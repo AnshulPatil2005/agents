@@ -58,7 +58,7 @@ func TestLoadSigningKeyAcceptsCommonEncodings(t *testing.T) {
 			// A loaded key must be immediately usable for issuance.
 			issuer, err := New("https://issuer.example", signing)
 			require.NoError(t, err)
-			rawJWT, _, err := issuer.IssueTrafficAccessToken("sub", testBinding())
+			rawJWT, _, err := issuer.IssueTrafficAccessToken("sub", testBinding(), 0)
 			require.NoError(t, err)
 			assert.NotEmpty(t, rawJWT)
 		})
@@ -99,7 +99,7 @@ func TestRotatedKeyIsVerifiableEndToEnd(t *testing.T) {
 	)
 	verifier := newRealVerifier(t, server)
 
-	rawJWT, _, err := issuer.IssueTrafficAccessToken("sub", testBinding())
+	rawJWT, _, err := issuer.IssueTrafficAccessToken("sub", testBinding(), 0)
 	require.NoError(t, err)
 	_, err = verifier.Verify(rawJWT)
 	require.NoError(t, err)

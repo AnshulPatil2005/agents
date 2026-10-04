@@ -71,7 +71,7 @@ func TestIssuedTokenPassesRealVerifier(t *testing.T) {
 			verifier := newRealVerifier(t, server)
 
 			binding := SandboxBinding{SandboxID: "default--sample", SandboxUID: "89d24507-936c-4a04-a958-b5d6a8277ed5"}
-			rawJWT, expiry, err := issuer.IssueTrafficAccessToken("e2b:controlplane:client", binding)
+			rawJWT, expiry, err := issuer.IssueTrafficAccessToken("e2b:controlplane:client", binding, 0)
 			require.NoError(t, err)
 
 			claims, err := verifier.Verify(rawJWT)
@@ -100,7 +100,7 @@ func TestRotationOverlapWindow(t *testing.T) {
 	beforeRotation, server := startIssuer(t, SigningKey{KeyID: "old", PrivateKey: oldKey})
 	staleVerifier := newRealVerifier(t, server)
 
-	tokenFromOldKey, _, err := beforeRotation.IssueTrafficAccessToken("sub", testBinding())
+	tokenFromOldKey, _, err := beforeRotation.IssueTrafficAccessToken("sub", testBinding(), 0)
 	require.NoError(t, err)
 	_, err = staleVerifier.Verify(tokenFromOldKey)
 	require.NoError(t, err)
@@ -113,7 +113,7 @@ func TestRotationOverlapWindow(t *testing.T) {
 	)
 	refreshedVerifier := newRealVerifier(t, publishServer)
 
-	tokenDuringOverlap, _, err := publishOnly.IssueTrafficAccessToken("sub", testBinding())
+	tokenDuringOverlap, _, err := publishOnly.IssueTrafficAccessToken("sub", testBinding(), 0)
 	require.NoError(t, err)
 	_, err = refreshedVerifier.Verify(tokenDuringOverlap)
 	require.NoError(t, err)
@@ -125,7 +125,7 @@ func TestRotationOverlapWindow(t *testing.T) {
 	)
 	rotatedVerifier := newRealVerifier(t, rotatedServer)
 
-	tokenFromNewKey, _, err := afterRotation.IssueTrafficAccessToken("sub", testBinding())
+	tokenFromNewKey, _, err := afterRotation.IssueTrafficAccessToken("sub", testBinding(), 0)
 	require.NoError(t, err)
 	_, err = rotatedVerifier.Verify(tokenFromNewKey)
 	require.NoError(t, err)
@@ -158,7 +158,7 @@ func TestVerifierRejectsTokensOutsideValidityWindow(t *testing.T) {
 			)
 			verifier := newRealVerifier(t, server)
 
-			rawJWT, _, err := issuer.IssueTrafficAccessToken("sub", testBinding())
+			rawJWT, _, err := issuer.IssueTrafficAccessToken("sub", testBinding(), 0)
 			require.NoError(t, err)
 
 			_, err = verifier.Verify(rawJWT)
@@ -175,7 +175,7 @@ func TestVerifierRejectsTokenFromAnotherIssuer(t *testing.T) {
 
 	verifier := newRealVerifier(t, trustedServer)
 
-	rawJWT, _, err := foreign.IssueTrafficAccessToken("sub", testBinding())
+	rawJWT, _, err := foreign.IssueTrafficAccessToken("sub", testBinding(), 0)
 	require.NoError(t, err)
 
 	_, err = verifier.Verify(rawJWT)
@@ -252,6 +252,80 @@ func TestNewValidatesInput(t *testing.T) {
 	}
 }
 
+// TestIssueTrafficAccessTokenValidity covers the per-call lifetime. The caller
+// resolves validity as policy per request, so a token must honour the value it
+// was given and fall back to the issuer default only when none was supplied.
+func TestIssueTrafficAccessTokenValidity(t *testing.T) {
+	// Pinned to a fixed instant so the expiry arithmetic is exact, but taken
+	// from now rather than a literal date so the real verifier still accepts
+	// the token inside its clock-skew window.
+	issuedAt := time.Now()
+
+	tests := []struct {
+		name string
+		// issuerLifetime configures the issuer default; zero leaves it unset so
+		// DefaultTokenLifetime applies.
+		issuerLifetime time.Duration
+		validity       time.Duration
+		wantLifetime   time.Duration
+	}{
+		{
+			name:         "zero falls back to the issuer default",
+			validity:     0,
+			wantLifetime: DefaultTokenLifetime,
+		},
+		{
+			name:           "zero falls back to a configured default",
+			issuerLifetime: 15 * time.Minute,
+			validity:       0,
+			wantLifetime:   15 * time.Minute,
+		},
+		{
+			name:           "a per-call validity overrides the default",
+			issuerLifetime: 15 * time.Minute,
+			validity:       2 * time.Hour,
+			wantLifetime:   2 * time.Hour,
+		},
+		{
+			name:           "a per-call validity shorter than the default is honoured",
+			issuerLifetime: time.Hour,
+			validity:       30 * time.Second,
+			wantLifetime:   30 * time.Second,
+		},
+		{
+			name:         "a negative validity is treated as unset",
+			validity:     -time.Hour,
+			wantLifetime: DefaultTokenLifetime,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			opts := []Option{withClock(func() time.Time { return issuedAt })}
+			if tt.issuerLifetime > 0 {
+				opts = append(opts, WithTokenLifetime(tt.issuerLifetime))
+			}
+			issuer, server := startIssuer(t,
+				SigningKey{KeyID: "active", PrivateKey: mustECDSAKey(t, elliptic.P256())}, opts...)
+			verifier := newRealVerifier(t, server)
+
+			rawJWT, expiry, err := issuer.IssueTrafficAccessToken("sub", testBinding(), tt.validity)
+			require.NoError(t, err)
+
+			assert.Equal(t, issuedAt.Add(tt.wantLifetime).Unix(), expiry.Unix(),
+				"returned expiry must reflect the resolved validity")
+
+			// The returned expiry is only useful if it matches what is sealed
+			// inside the token, since callers record one and verifiers read the
+			// other. Verifying through the real verifier also proves a token with
+			// a per-call lifetime is still accepted rather than merely issued.
+			claims, err := verifier.Verify(rawJWT)
+			require.NoError(t, err)
+			assert.WithinDuration(t, expiry, claims.Expiry.Time(), time.Second)
+		})
+	}
+}
+
 func TestIssueTrafficAccessTokenValidatesBinding(t *testing.T) {
 	issuer, err := New("https://issuer.example", SigningKey{KeyID: "active", PrivateKey: mustECDSAKey(t, elliptic.P256())})
 	require.NoError(t, err)
@@ -279,7 +353,7 @@ func TestIssueTrafficAccessTokenValidatesBinding(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			rawJWT, _, err := issuer.IssueTrafficAccessToken(tt.subject, tt.binding)
+			rawJWT, _, err := issuer.IssueTrafficAccessToken(tt.subject, tt.binding, 0)
 			require.Error(t, err)
 			assert.Contains(t, err.Error(), tt.expectError)
 			assert.Empty(t, rawJWT)
@@ -435,7 +509,7 @@ func TestIssuerBehindPathPrefix(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	rawJWT, _, err := issuer.IssueTrafficAccessToken("sub", testBinding())
+	rawJWT, _, err := issuer.IssueTrafficAccessToken("sub", testBinding(), 0)
 	require.NoError(t, err)
 
 	claims, err := verifier.Verify(rawJWT)
