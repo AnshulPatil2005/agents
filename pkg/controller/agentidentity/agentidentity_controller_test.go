@@ -18,6 +18,7 @@ package agentidentity
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	apiMeta "k8s.io/apimachinery/pkg/api/meta"
@@ -25,21 +26,29 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/client-go/rest"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
+	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
 	securityv1alpha1 "github.com/openkruise/agents/api/security/v1alpha1"
 )
 
 const testNamespace = "team-a"
 
-// scheme carries only this group, which is everything the controller reads.
+// scheme carries this group plus the built-in types a manager needs.
 var scheme = func() *runtime.Scheme {
 	s := runtime.NewScheme()
+	utilruntime.Must(clientgoscheme.AddToScheme(s))
 	utilruntime.Must(securityv1alpha1.AddToScheme(s))
 	return s
 }()
+
+// errBoom stands in for any non-NotFound API failure.
+var errBoom = errors.New("boom")
 
 // identity builds an AgentIdentity referencing the named AgentAuthenticationConfigs.
 func identity(name string, generation int64, refNames ...string) *securityv1alpha1.AgentIdentity {
@@ -335,5 +344,135 @@ func TestIdentitiesForAuthConfig(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestReconcileAPIFailures covers the paths where the API itself fails rather
+// than reporting absence. Each must surface the error so the work is retried,
+// and the first must leave the condition unwritten: an identity whose
+// dependencies could not be read is unknown, not broken, and reporting it as
+// not-Ready would fail issuance closed on a blip.
+func TestReconcileAPIFailures(t *testing.T) {
+	tests := []struct {
+		name  string
+		funcs interceptor.Funcs
+	}{
+		{
+			name: "config lookup fails",
+			funcs: interceptor.Funcs{
+				Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey,
+					obj client.Object, opts ...client.GetOption) error {
+					if _, ok := obj.(*securityv1alpha1.AgentAuthenticationConfig); ok {
+						return errBoom
+					}
+					return c.Get(ctx, key, obj, opts...)
+				},
+			},
+		},
+		{
+			name: "status patch fails",
+			funcs: interceptor.Funcs{
+				SubResourcePatch: func(_ context.Context, _ client.Client, _ string,
+					_ client.Object, _ client.Patch, _ ...client.SubResourcePatchOption) error {
+					return errBoom
+				},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r := &Reconciler{Client: fake.NewClientBuilder().WithScheme(scheme).
+				WithStatusSubresource(&securityv1alpha1.AgentIdentity{}).
+				WithObjects(identity("sample-agent", 1, "keycloak"),
+					authConfig(testNamespace, "keycloak", metav1.ConditionTrue)).
+				WithInterceptorFuncs(tt.funcs).Build()}
+			key := types.NamespacedName{Namespace: testNamespace, Name: "sample-agent"}
+
+			_, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: key})
+			if !errors.Is(err, errBoom) {
+				t.Fatalf("Reconcile error: got %v, want %v", err, errBoom)
+			}
+		})
+	}
+}
+
+// TestReconcileLeavesConditionUnsetOnLookupFailure is the half of the above
+// that the error return alone does not prove: nothing was written to status.
+func TestReconcileLeavesConditionUnsetOnLookupFailure(t *testing.T) {
+	r := &Reconciler{Client: fake.NewClientBuilder().WithScheme(scheme).
+		WithStatusSubresource(&securityv1alpha1.AgentIdentity{}).
+		WithObjects(identity("sample-agent", 1, "keycloak")).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey,
+				obj client.Object, opts ...client.GetOption) error {
+				if _, ok := obj.(*securityv1alpha1.AgentAuthenticationConfig); ok {
+					return errBoom
+				}
+				return c.Get(ctx, key, obj, opts...)
+			},
+		}).Build()}
+	key := types.NamespacedName{Namespace: testNamespace, Name: "sample-agent"}
+
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: key}); err == nil {
+		t.Fatal("expected an error from Reconcile")
+	}
+
+	got := &securityv1alpha1.AgentIdentity{}
+	if err := r.Get(context.Background(), key, got); err != nil {
+		t.Fatalf("getting the identity: %v", err)
+	}
+	if c := apiMeta.FindStatusCondition(got.Status.Conditions, securityv1alpha1.ConditionReady); c != nil {
+		t.Errorf("condition was written despite a failed lookup: %+v", c)
+	}
+}
+
+// TestIdentitiesForAuthConfigListFailure covers the map function's error path.
+// A failed list yields no requests rather than a panic or a partial fan-out.
+func TestIdentitiesForAuthConfigListFailure(t *testing.T) {
+	r := &Reconciler{Client: fake.NewClientBuilder().WithScheme(scheme).
+		WithInterceptorFuncs(interceptor.Funcs{
+			List: func(_ context.Context, _ client.WithWatch, _ client.ObjectList,
+				_ ...client.ListOption) error {
+				return errBoom
+			},
+		}).Build()}
+
+	got := r.identitiesForAuthConfig(context.Background(),
+		authConfig(testNamespace, "keycloak", metav1.ConditionTrue))
+	if got != nil {
+		t.Errorf("expected no requests when the list fails, got %v", got)
+	}
+}
+
+// newTestManager builds a real manager over a stub REST config, following the
+// pattern in the sandboxset and controller-registry tests. It is never started,
+// so no apiserver is needed; only the registration wiring is exercised.
+func newTestManager(t *testing.T) ctrl.Manager {
+	t.Helper()
+	mgr, err := ctrl.NewManager(&rest.Config{Host: "http://127.0.0.1:0"}, ctrl.Options{
+		Scheme:                 scheme,
+		Metrics:                metricsserver.Options{BindAddress: "0"},
+		HealthProbeBindAddress: "0",
+	})
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+	return mgr
+}
+
+func TestSetupWithManager(t *testing.T) {
+	mgr := newTestManager(t)
+	if err := (&Reconciler{Client: mgr.GetClient()}).SetupWithManager(mgr); err != nil {
+		t.Fatalf("SetupWithManager: unexpected error: %v", err)
+	}
+}
+
+// TestAddWithoutCRD covers the opt-in guard. With no discovery client
+// registered, DiscoverGVK reports the kind absent, so Add must return nil
+// without registering a controller.
+func TestAddWithoutCRD(t *testing.T) {
+	if err := Add(newTestManager(t)); err != nil {
+		t.Fatalf("Add with the CRD absent: unexpected error: %v", err)
 	}
 }
