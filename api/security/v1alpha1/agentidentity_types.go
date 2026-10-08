@@ -56,14 +56,19 @@ type AuthenticationConfigReference struct {
 // editing a resource it controls.
 type AgentIdentitySpec struct {
 	// AuthenticationRefs lists the issuers allowed to authenticate end users
-	// delegating to this agent.
+	// delegating to this agent. At least one is required.
 	//
-	// These are consumed when exchanging a principal token, not when issuing an
-	// agent token: an agent token proves the workload and needs no end user.
-	// +optional
+	// An identity that names no issuer cannot take part in a principal token
+	// exchange, so it is not usable and must not report Ready. The constraint is
+	// declared here rather than left to the controller so the API server rejects
+	// an empty list outright, but the controller still fails an existing object
+	// closed: an object created before this constraint can carry an empty list
+	// that admission never saw.
+	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:MinItems=1
 	// +kubebuilder:validation:MaxItems=32
 	// +listType=atomic
-	AuthenticationRefs []AuthenticationConfigReference `json:"authenticationRefs,omitempty"`
+	AuthenticationRefs []AuthenticationConfigReference `json:"authenticationRefs"`
 }
 
 // AgentIdentityStatus reports whether the identity is usable.
@@ -100,8 +105,7 @@ type AgentIdentity struct {
 	metav1.ObjectMeta `json:"metadata,omitempty"`
 
 	// Spec defines the agent identity.
-	// +optional
-	Spec AgentIdentitySpec `json:"spec,omitempty"`
+	Spec AgentIdentitySpec `json:"spec"`
 
 	// Status is the current state of the identity.
 	// +optional

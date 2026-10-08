@@ -75,17 +75,41 @@ func identity(name string, generation int64, refNames ...string) *securityv1alph
 // observed it: present in the API, not yet known to be usable.
 func authConfig(namespace, name string, ready metav1.ConditionStatus) *securityv1alpha1.AgentAuthenticationConfig {
 	config := &securityv1alpha1.AgentAuthenticationConfig{
-		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace},
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace, Generation: 1},
 	}
 	if ready == "" {
 		return config
 	}
+	// A config built here reports on the generation it is actually at, which is
+	// what makes it usable. staleConfig is the counterpart.
+	config.Status.ObservedGeneration = config.Generation
 	config.Status.Conditions = []metav1.Condition{{
 		Type:               securityv1alpha1.ConditionReady,
 		Status:             ready,
 		Reason:             "Test",
+		ObservedGeneration: config.Generation,
 		LastTransitionTime: metav1.Now(),
 	}}
+	return config
+}
+
+// staleConfig is Ready=True for a generation its spec has already moved past,
+// which is what a config looks like between an edit and its controller catching
+// up. The condition still says True and means nothing.
+func staleConfig(namespace, name string) *securityv1alpha1.AgentAuthenticationConfig {
+	config := authConfig(namespace, name, metav1.ConditionTrue)
+	config.Generation = 2
+	return config
+}
+
+// deletingConfig is Ready=True with deletion already requested. A finalizer can
+// hold it in the API indefinitely, so this is exactly the window in which a
+// consumer would otherwise keep treating it as usable.
+func deletingConfig(namespace, name string) *securityv1alpha1.AgentAuthenticationConfig {
+	config := authConfig(namespace, name, metav1.ConditionTrue)
+	now := metav1.Now()
+	config.DeletionTimestamp = &now
+	config.Finalizers = []string{"agents.kruise.io/test"}
 	return config
 }
 
@@ -112,10 +136,13 @@ func TestReconcile(t *testing.T) {
 		wantObservedGen int64
 	}{
 		{
-			name:            "no references is ready",
+			// Admission now rejects an empty list, so this covers an object that
+			// predates the constraint. It must fail closed, not read as "nothing
+			// to check, therefore fine".
+			name:            "no references is not ready",
 			identity:        identity("standalone-agent", 3),
-			wantStatus:      metav1.ConditionTrue,
-			wantReason:      reasonValidated,
+			wantStatus:      metav1.ConditionFalse,
+			wantReason:      reasonNoAuthenticationRefs,
 			wantObservedGen: 3,
 		},
 		{
@@ -163,6 +190,28 @@ func TestReconcile(t *testing.T) {
 			configs:         []client.Object{authConfig(testNamespace, "keycloak", "")},
 			wantStatus:      metav1.ConditionFalse,
 			wantReason:      reasonAuthenticationConfigNotReady,
+			wantObservedGen: 1,
+		},
+		{
+			// A config whose spec has changed keeps its previous Ready=True until
+			// its own controller catches up. That verdict describes the old spec,
+			// so it cannot be trusted for the new one.
+			name:            "config with a stale status is not ready",
+			identity:        identity("sample-agent", 1, "keycloak"),
+			configs:         []client.Object{staleConfig(testNamespace, "keycloak")},
+			wantStatus:      metav1.ConditionFalse,
+			wantReason:      reasonAuthenticationConfigStale,
+			wantObservedGen: 1,
+		},
+		{
+			// Deletion is treated as unusable the moment it is requested, not when
+			// the object finally disappears, because a finalizer can hold it in the
+			// API with its last Ready=True still visible.
+			name:            "config being deleted is not ready",
+			identity:        identity("sample-agent", 1, "keycloak"),
+			configs:         []client.Object{deletingConfig(testNamespace, "keycloak")},
+			wantStatus:      metav1.ConditionFalse,
+			wantReason:      reasonAuthenticationConfigDeleting,
 			wantObservedGen: 1,
 		},
 		{
@@ -429,20 +478,85 @@ func TestReconcileLeavesConditionUnsetOnLookupFailure(t *testing.T) {
 
 // TestIdentitiesForAuthConfigListFailure covers the map function's error path.
 // A failed list yields no requests rather than a panic or a partial fan-out.
-func TestIdentitiesForAuthConfigListFailure(t *testing.T) {
-	r := &Reconciler{Client: fake.NewClientBuilder().WithScheme(scheme).
+// TestConvergesAfterADroppedConfigEvent is the guarantee behind the map
+// function being best-effort.
+//
+// handler.EnqueueRequestsFromMapFunc cannot return an error, so a failed list
+// drops the configuration-change event with nowhere to report it. Correctness
+// therefore cannot depend on that event arriving. This drops the event, then
+// shows the identity still converges on the next reconcile, and that every
+// successful reconcile schedules one.
+func TestConvergesAfterADroppedConfigEvent(t *testing.T) {
+	listFails := true
+	fc := fake.NewClientBuilder().WithScheme(scheme).
+		WithStatusSubresource(&securityv1alpha1.AgentIdentity{}).
+		WithObjects(identity("sample-agent", 1, "keycloak"),
+			authConfig(testNamespace, "keycloak", metav1.ConditionTrue)).
 		WithInterceptorFuncs(interceptor.Funcs{
-			List: func(_ context.Context, _ client.WithWatch, _ client.ObjectList,
-				_ ...client.ListOption) error {
-				return errBoom
+			List: func(ctx context.Context, c client.WithWatch, list client.ObjectList,
+				opts ...client.ListOption) error {
+				if listFails {
+					return errBoom
+				}
+				return c.List(ctx, list, opts...)
 			},
-		}).Build()}
+		}).Build()
+	r := &Reconciler{Client: fc}
+	ctx := context.Background()
+	key := types.NamespacedName{Namespace: testNamespace, Name: "sample-agent"}
 
-	got := r.identitiesForAuthConfig(context.Background(),
-		authConfig(testNamespace, "keycloak", metav1.ConditionTrue))
-	if got != nil {
-		t.Errorf("expected no requests when the list fails, got %v", got)
+	// The identity starts Ready, as its config is Ready and current.
+	res, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: key})
+	require(t, err)
+	if res.RequeueAfter != resyncInterval {
+		t.Fatalf("a successful reconcile must schedule a resync: got %v, want %v",
+			res.RequeueAfter, resyncInterval)
 	}
+	if got := readyConditionOf(t, r, key); got == nil || got.Status != metav1.ConditionTrue {
+		t.Fatalf("expected Ready=True to begin with, got %+v", got)
+	}
+
+	// The config is deleted. The fan-out that would normally notice drops the
+	// event, so nothing requeues the identity and its verdict is now stale.
+	config := authConfig(testNamespace, "keycloak", metav1.ConditionTrue)
+	if err := fc.Delete(ctx, config); err != nil {
+		t.Fatalf("deleting the config: %v", err)
+	}
+	if dropped := r.identitiesForAuthConfig(ctx, config); dropped != nil {
+		t.Fatalf("expected the failed list to drop the event, got %v", dropped)
+	}
+	if got := readyConditionOf(t, r, key); got == nil || got.Status != metav1.ConditionTrue {
+		t.Fatalf("the identity should still hold its stale verdict, got %+v", got)
+	}
+
+	// The resync arrives and the identity converges without the event.
+	listFails = false
+	if _, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: key}); err != nil {
+		t.Fatalf("reconcile after the dropped event: %v", err)
+	}
+	got := readyConditionOf(t, r, key)
+	if got == nil || got.Status != metav1.ConditionFalse {
+		t.Fatalf("expected Ready=False after convergence, got %+v", got)
+	}
+	if got.Reason != reasonAuthenticationConfigNotFound {
+		t.Errorf("reason: got %q, want %q", got.Reason, reasonAuthenticationConfigNotFound)
+	}
+}
+
+func require(t *testing.T, err error) {
+	t.Helper()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func readyConditionOf(t *testing.T, r *Reconciler, key types.NamespacedName) *metav1.Condition {
+	t.Helper()
+	got := &securityv1alpha1.AgentIdentity{}
+	if err := r.Get(context.Background(), key, got); err != nil {
+		t.Fatalf("getting the identity: %v", err)
+	}
+	return apiMeta.FindStatusCondition(got.Status.Conditions, securityv1alpha1.ConditionReady)
 }
 
 // newTestManager builds a real manager over a stub REST config, following the
