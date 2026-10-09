@@ -38,7 +38,7 @@ import (
 
 	securityv1alpha1 "github.com/openkruise/agents/api/security/v1alpha1"
 	"github.com/openkruise/agents/client"
-	"github.com/openkruise/agents/pkg/controller/agentidentity"
+	"github.com/openkruise/agents/pkg/agentidentity"
 )
 
 var (
