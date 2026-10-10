@@ -1,11 +1,10 @@
 name: E2E for E2B SDK - latest
 
 on:
-  push:
-    branches:
-      - master
-      - release-*
-  pull_request: { }
+  schedule:
+    # Daily at 02:00 UTC (10:00 Beijing). Scheduled runs only fire from the
+    # default branch, so this cron must be present on master to take effect.
+    - cron: '0 2 * * *'
   workflow_dispatch: { }
 
 # Declare default permissions as read only.
@@ -279,10 +278,9 @@ jobs:
             args+=(--test-file test/e2b/test_peer_mtls.py)
             args+=(-m peer_mtls)
           fi
-          # Temporarily pinned: e2b 2.38.0 removed the http2 kwarg of
-          # get_transport() that e2b-code-interpreter 2.9.0 still passes.
-          # 2.37.1 + 2.9.0 is the last verified working combination.
-          bash hack/run-e2b-e2e-test.sh "${args[@]}" --e2b-version 2.37.1 --sdk-version 2.9.0 --pytest-extra-args "-s -x"
+          # Install the latest e2b / e2b-code-interpreter (no version pins):
+          # this suite tracks the newest SDK releases on a daily schedule.
+          bash hack/run-e2b-e2e-test.sh "${args[@]}" --pytest-extra-args "-s -x"
 
       - name: Peer mTLS diagnostics
         if: always() && matrix.peer_mtls
