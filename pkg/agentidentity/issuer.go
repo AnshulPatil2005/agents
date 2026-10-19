@@ -101,25 +101,9 @@ func AddIssuer(mgr ctrl.Manager, cfg IssuerConfig) (*jwtissuer.Issuer, error) {
 		return nil, fmt.Errorf("build issuer endpoints: %w", err)
 	}
 
-	// The certificate is read per handshake rather than cached at startup, so a
-	// renewal written into the mounted volume is picked up without a restart.
-	// cert-manager rotates well before expiry, but a pod that cached the old
-	// pair would still serve it until something restarted it.
-	tlsConfig := &tls.Config{
-		MinVersion: tls.VersionTLS12,
-		GetCertificate: func(*tls.ClientHelloInfo) (*tls.Certificate, error) {
-			certificate, err := tls.LoadX509KeyPair(cfg.TLSCertFile, cfg.TLSKeyFile)
-			if err != nil {
-				return nil, fmt.Errorf("load issuer serving certificate: %w", err)
-			}
-			return &certificate, nil
-		},
-	}
-
-	// Loaded once here so a bad or missing pair fails startup rather than every
-	// handshake, which would otherwise look like a healthy pod serving errors.
-	if _, err := tls.LoadX509KeyPair(cfg.TLSCertFile, cfg.TLSKeyFile); err != nil {
-		return nil, fmt.Errorf("load issuer serving certificate: %w", err)
+	tlsConfig, err := servingTLSConfig(cfg.TLSCertFile, cfg.TLSKeyFile)
+	if err != nil {
+		return nil, err
 	}
 
 	server := &http.Server{
@@ -147,6 +131,31 @@ func AddIssuer(mgr ctrl.Manager, cfg IssuerConfig) (*jwtissuer.Issuer, error) {
 	klog.InfoS("Token issuance is enabled", "issuerURL", cfg.IssuerURL,
 		"keyID", signingKey.KeyID, "bindAddress", cfg.BindAddress)
 	return issuer, nil
+}
+
+// servingTLSConfig builds the TLS configuration for the issuer endpoints.
+//
+// The certificate is read per handshake rather than cached, so a renewal
+// written into the mounted volume is picked up without a restart. cert-manager
+// rotates well before expiry, but a pod that cached the old pair would keep
+// serving it until something restarted it.
+//
+// The pair is also loaded once here so a bad or missing one fails startup,
+// rather than becoming a healthy-looking pod that fails every handshake.
+func servingTLSConfig(certFile, keyFile string) (*tls.Config, error) {
+	if _, err := tls.LoadX509KeyPair(certFile, keyFile); err != nil {
+		return nil, fmt.Errorf("load issuer serving certificate: %w", err)
+	}
+	return &tls.Config{
+		MinVersion: tls.VersionTLS12,
+		GetCertificate: func(*tls.ClientHelloInfo) (*tls.Certificate, error) {
+			certificate, err := tls.LoadX509KeyPair(certFile, keyFile)
+			if err != nil {
+				return nil, fmt.Errorf("load issuer serving certificate: %w", err)
+			}
+			return &certificate, nil
+		},
+	}, nil
 }
 
 // serve runs server on listener until ctx is cancelled, then drains it.

@@ -49,10 +49,6 @@ type Discovered struct {
 // discovery URL is operator-supplied and may point at something that is not a
 // discovery document.
 func Discover(ctx context.Context, discoveryURL string, opts Options) (Discovered, error) {
-	if err := validateHTTPSURL(discoveryURL); err != nil {
-		return Discovered{}, fmt.Errorf("discovery URL: %w", err)
-	}
-
 	opts = withDefaults(opts)
 	httpClient := &http.Client{
 		Timeout: opts.HTTPTimeout,
@@ -64,6 +60,21 @@ func Discover(ctx context.Context, discoveryURL string, opts Options) (Discovere
 		},
 	}
 	defer httpClient.CloseIdleConnections()
+
+	return discoverWith(ctx, httpClient, discoveryURL, opts)
+}
+
+// discoverWith is Discover once the HTTP client is decided.
+//
+// Split out so tests can supply a client that trusts a local test server's
+// certificate. Discover itself trusts only the system roots, which is correct
+// in production and means its success path is otherwise unreachable in a unit
+// test.
+func discoverWith(ctx context.Context, httpClient *http.Client,
+	discoveryURL string, opts Options) (Discovered, error) {
+	if err := validateHTTPSURL(discoveryURL); err != nil {
+		return Discovered{}, fmt.Errorf("discovery URL: %w", err)
+	}
 
 	document := discoveryDocument{}
 	if err := fetchJSON(ctx, httpClient, discoveryURL, opts.MaxResponseSize, &document); err != nil {

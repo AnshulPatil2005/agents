@@ -17,6 +17,7 @@ limitations under the License.
 package agentidentity
 
 import (
+	"bytes"
 	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
@@ -352,5 +353,95 @@ func fetchJSON(t *testing.T, client *http.Client, url string, into any) {
 	}
 	if err := json.NewDecoder(resp.Body).Decode(into); err != nil {
 		t.Fatalf("decode %s: %v", url, err)
+	}
+}
+
+// TestServingCertificateIsReloadedPerHandshake covers the claim in
+// servingTLSConfig: a renewal written into the mounted volume must be picked up
+// without a restart. A config that cached the pair at startup would keep
+// serving the old certificate and pass every other test here.
+func TestServingCertificateIsReloadedPerHandshake(t *testing.T) {
+	certFile, keyFile := writeServingPair(t)
+
+	tlsConfig, err := servingTLSConfig(certFile, keyFile)
+	if err != nil {
+		t.Fatalf("servingTLSConfig: %v", err)
+	}
+
+	first, err := tlsConfig.GetCertificate(&tls.ClientHelloInfo{})
+	if err != nil {
+		t.Fatalf("first GetCertificate: %v", err)
+	}
+
+	// Simulate cert-manager rewriting the mounted files in place.
+	renewedCert, renewedKey := writeServingPair(t)
+	renewedCertPEM, err := os.ReadFile(renewedCert)
+	if err != nil {
+		t.Fatalf("read renewed certificate: %v", err)
+	}
+	renewedKeyPEM, err := os.ReadFile(renewedKey)
+	if err != nil {
+		t.Fatalf("read renewed key: %v", err)
+	}
+	if err := os.WriteFile(certFile, renewedCertPEM, 0o600); err != nil {
+		t.Fatalf("overwrite certificate: %v", err)
+	}
+	if err := os.WriteFile(keyFile, renewedKeyPEM, 0o600); err != nil {
+		t.Fatalf("overwrite key: %v", err)
+	}
+
+	second, err := tlsConfig.GetCertificate(&tls.ClientHelloInfo{})
+	if err != nil {
+		t.Fatalf("GetCertificate after renewal: %v", err)
+	}
+
+	if bytes.Equal(first.Certificate[0], second.Certificate[0]) {
+		t.Error("the renewed certificate was not picked up; the pair is being cached")
+	}
+}
+
+// TestServingCertificateErrorsAfterTheFilesGoAway covers the handshake-time
+// failure path, which is what a deleted or truncated Secret projection looks
+// like once the process is already running.
+func TestServingCertificateErrorsAfterTheFilesGoAway(t *testing.T) {
+	certFile, keyFile := writeServingPair(t)
+	tlsConfig, err := servingTLSConfig(certFile, keyFile)
+	if err != nil {
+		t.Fatalf("servingTLSConfig: %v", err)
+	}
+	if err := os.Remove(certFile); err != nil {
+		t.Fatalf("remove certificate: %v", err)
+	}
+	if _, err := tlsConfig.GetCertificate(&tls.ClientHelloInfo{}); err == nil {
+		t.Error("expected a handshake to fail once the certificate is gone")
+	}
+}
+
+// TestAddIssuerFailsOnAnOccupiedPort covers binding in AddIssuer rather than in
+// the Runnable: a port already in use must fail startup, not surface later from
+// a goroutine nobody is watching.
+func TestAddIssuerFailsOnAnOccupiedPort(t *testing.T) {
+	occupied, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer func() { _ = occupied.Close() }()
+
+	certFile, keyFile := writeServingPair(t)
+	issuer, err := AddIssuer(newTestManager(t), IssuerConfig{
+		IssuerURL:      "https://issuer.test",
+		SigningKeyFile: writeSigningKey(t),
+		TLSCertFile:    certFile,
+		TLSKeyFile:     keyFile,
+		BindAddress:    occupied.Addr().String(),
+	})
+	if err == nil {
+		t.Fatal("expected an occupied port to fail startup")
+	}
+	if !strings.Contains(err.Error(), "listen for issuer endpoints") {
+		t.Errorf("error: got %q, want it to mention the listen failure", err)
+	}
+	if issuer != nil {
+		t.Error("a failed AddIssuer must not return an issuer")
 	}
 }
