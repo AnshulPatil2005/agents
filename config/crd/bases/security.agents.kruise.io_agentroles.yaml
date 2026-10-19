@@ -61,16 +61,20 @@ spec:
                   which is valid but useless, so at least one is required to make an
                   accidentally empty role visible at admission instead of at request time.
 
-                  The CEL rule enforces the one constraint that cannot be expressed per
-                  field: GetResourceOAuth2Token must name a provider exactly, because a
-                  wildcard would also grant every CredentialProvider added in future.
+                  The action-to-kind constraints live on AgentRoleRule rather than here, so
+                  a violation points at spec.rules[i].resources[j] instead of the whole list.
                 items:
                   description: |-
                     AgentRoleRule permits a set of actions on a set of resources.
 
-                    A resource is either "*" or "<Kind>/<name>", naming what the action applies
-                    to. Which kinds are meaningful depends on the action: ExchangePrincipalToken
-                    acts on an AgentIdentity, GetResourceOAuth2Token on a CredentialProvider.
+                    A resource is either "*" or "<Kind>/<name>", and §5.4 pins each action to one
+                    kind: ExchangePrincipalToken acts on an AgentIdentity, GetResourceOAuth2Token
+                    on a CredentialProvider. Both are enforced below, so a rule that could never
+                    match anything is rejected at admission rather than silently granting nothing.
+
+                    A consequence worth knowing: one rule cannot list both actions, because they
+                    require different resource kinds and no resource satisfies both. Grant them
+                    as separate rules, which is also how §5.4's example is written.
                   properties:
                     actions:
                       description: Actions permitted by this rule.
@@ -84,10 +88,17 @@ spec:
                       type: array
                       x-kubernetes-list-type: set
                     resources:
-                      description: Resources the actions apply to, as "*" or "<Kind>/<name>".
+                      description: |-
+                        Resources the actions apply to, as "*" or "<Kind>/<name>".
+
+                        MaxLength is the 19-character "CredentialProvider/" prefix plus a
+                        253-character name. The pattern rejects a bare name, an unknown kind and
+                        anything that is not a DNS name after the prefix, including a wildcard in
+                        the name position.
                       items:
-                        maxLength: 317
+                        maxLength: 272
                         minLength: 1
+                        pattern: ^(\*|(AgentIdentity|CredentialProvider)/[a-z0-9]([-a-z0-9.]*[a-z0-9])?)$
                         type: string
                       maxItems: 32
                       minItems: 1
@@ -97,15 +108,17 @@ spec:
                   - actions
                   - resources
                   type: object
+                  x-kubernetes-validations:
+                  - message: GetResourceOAuth2Token resources must be CredentialProvider/<name>
+                    rule: '!(''GetResourceOAuth2Token'' in self.actions) || self.resources.all(x,
+                      x.startsWith(''CredentialProvider/''))'
+                  - message: ExchangePrincipalToken resources must be * or AgentIdentity/<name>
+                    rule: '!(''ExchangePrincipalToken'' in self.actions) || self.resources.all(x,
+                      x == ''*'' || x.startsWith(''AgentIdentity/''))'
                 maxItems: 64
                 minItems: 1
                 type: array
                 x-kubernetes-list-type: atomic
-                x-kubernetes-validations:
-                - message: GetResourceOAuth2Token must name a CredentialProvider exactly
-                    and cannot use a wildcard
-                  rule: self.all(r, !('GetResourceOAuth2Token' in r.actions) || !r.resources.exists(x,
-                    x.contains('*')))
             required:
             - rules
             type: object

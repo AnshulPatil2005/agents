@@ -37,9 +37,17 @@ const (
 
 // AgentRoleRule permits a set of actions on a set of resources.
 //
-// A resource is either "*" or "<Kind>/<name>", naming what the action applies
-// to. Which kinds are meaningful depends on the action: ExchangePrincipalToken
-// acts on an AgentIdentity, GetResourceOAuth2Token on a CredentialProvider.
+// A resource is either "*" or "<Kind>/<name>", and §5.4 pins each action to one
+// kind: ExchangePrincipalToken acts on an AgentIdentity, GetResourceOAuth2Token
+// on a CredentialProvider. Both are enforced below, so a rule that could never
+// match anything is rejected at admission rather than silently granting nothing.
+//
+// A consequence worth knowing: one rule cannot list both actions, because they
+// require different resource kinds and no resource satisfies both. Grant them
+// as separate rules, which is also how §5.4's example is written.
+//
+// +kubebuilder:validation:XValidation:rule="!('GetResourceOAuth2Token' in self.actions) || self.resources.all(x, x.startsWith('CredentialProvider/'))",message="GetResourceOAuth2Token resources must be CredentialProvider/<name>"
+// +kubebuilder:validation:XValidation:rule="!('ExchangePrincipalToken' in self.actions) || self.resources.all(x, x == '*' || x.startsWith('AgentIdentity/'))",message="ExchangePrincipalToken resources must be * or AgentIdentity/<name>"
 type AgentRoleRule struct {
 	// Actions permitted by this rule.
 	// +kubebuilder:validation:Required
@@ -50,11 +58,17 @@ type AgentRoleRule struct {
 	Actions []string `json:"actions"`
 
 	// Resources the actions apply to, as "*" or "<Kind>/<name>".
+	//
+	// MaxLength is the 19-character "CredentialProvider/" prefix plus a
+	// 253-character name. The pattern rejects a bare name, an unknown kind and
+	// anything that is not a DNS name after the prefix, including a wildcard in
+	// the name position.
 	// +kubebuilder:validation:Required
 	// +kubebuilder:validation:MinItems=1
 	// +kubebuilder:validation:MaxItems=32
 	// +kubebuilder:validation:items:MinLength=1
-	// +kubebuilder:validation:items:MaxLength=317
+	// +kubebuilder:validation:items:MaxLength=272
+	// +kubebuilder:validation:items:Pattern=`^(\*|(AgentIdentity|CredentialProvider)/[a-z0-9]([-a-z0-9.]*[a-z0-9])?)$`
 	// +listType=set
 	Resources []string `json:"resources"`
 }
@@ -69,14 +83,12 @@ type AgentRoleSpec struct {
 	// which is valid but useless, so at least one is required to make an
 	// accidentally empty role visible at admission instead of at request time.
 	//
-	// The CEL rule enforces the one constraint that cannot be expressed per
-	// field: GetResourceOAuth2Token must name a provider exactly, because a
-	// wildcard would also grant every CredentialProvider added in future.
+	// The action-to-kind constraints live on AgentRoleRule rather than here, so
+	// a violation points at spec.rules[i].resources[j] instead of the whole list.
 	// +kubebuilder:validation:Required
 	// +kubebuilder:validation:MinItems=1
 	// +kubebuilder:validation:MaxItems=64
 	// +listType=atomic
-	// +kubebuilder:validation:XValidation:rule="self.all(r, !('GetResourceOAuth2Token' in r.actions) || !r.resources.exists(x, x.contains('*')))",message="GetResourceOAuth2Token must name a CredentialProvider exactly and cannot use a wildcard"
 	Rules []AgentRoleRule `json:"rules"`
 }
 
