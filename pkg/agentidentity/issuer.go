@@ -27,6 +27,7 @@ import (
 
 	"k8s.io/klog/v2"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/certwatcher"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 
 	"github.com/openkruise/agents/pkg/identity/jwtissuer"
@@ -101,14 +102,20 @@ func AddIssuer(mgr ctrl.Manager, cfg IssuerConfig) (*jwtissuer.Issuer, error) {
 		return nil, fmt.Errorf("build issuer endpoints: %w", err)
 	}
 
-	tlsConfig, err := servingTLSConfig(cfg.TLSCertFile, cfg.TLSKeyFile)
+	// certwatcher caches the parsed pair and refreshes it from fsnotify events
+	// plus a poll, so a cert-manager renewal is still picked up without a
+	// restart but a handshake does not read the files.
+	watcher, err := certwatcher.New(cfg.TLSCertFile, cfg.TLSKeyFile)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("watch issuer serving certificate: %w", err)
 	}
 
 	server := &http.Server{
-		Handler:           handler,
-		TLSConfig:         tlsConfig,
+		Handler: handler,
+		TLSConfig: &tls.Config{
+			MinVersion:     tls.VersionTLS12,
+			GetCertificate: watcher.GetCertificate,
+		},
 		ReadHeaderTimeout: readHeaderTimeout,
 	}
 
@@ -118,14 +125,26 @@ func AddIssuer(mgr ctrl.Manager, cfg IssuerConfig) (*jwtissuer.Issuer, error) {
 	if err != nil {
 		return nil, fmt.Errorf("listen for issuer endpoints on %s: %w", cfg.BindAddress, err)
 	}
+	closeListener := func(err error) error {
+		if closeErr := listener.Close(); closeErr != nil && !errors.Is(closeErr, net.ErrClosed) {
+			return errors.Join(err, closeErr)
+		}
+		return err
+	}
 
-	if err := mgr.Add(manager.RunnableFunc(func(ctx context.Context) error {
+	// Both of these must run on every replica, not just the leader. Discovery
+	// and JWKS are read-only, every replica has already bound the port, and
+	// /readyz answers before the lease is held, so a non-leader would enter
+	// Service endpoints and then accept connections it never answers.
+	if err := mgr.Add(everyReplica(func(ctx context.Context) error {
+		return watcher.Start(ctx)
+	})); err != nil {
+		return nil, closeListener(fmt.Errorf("register the certificate watcher: %w", err))
+	}
+	if err := mgr.Add(everyReplica(func(ctx context.Context) error {
 		return serve(ctx, server, listener)
 	})); err != nil {
-		if closeErr := listener.Close(); closeErr != nil && !errors.Is(closeErr, net.ErrClosed) {
-			err = errors.Join(err, closeErr)
-		}
-		return nil, fmt.Errorf("register issuer endpoints: %w", err)
+		return nil, closeListener(fmt.Errorf("register issuer endpoints: %w", err))
 	}
 
 	klog.InfoS("Token issuance is enabled", "issuerURL", cfg.IssuerURL,
@@ -133,29 +152,24 @@ func AddIssuer(mgr ctrl.Manager, cfg IssuerConfig) (*jwtissuer.Issuer, error) {
 	return issuer, nil
 }
 
-// servingTLSConfig builds the TLS configuration for the issuer endpoints.
+// unconditionalRunnable is a Runnable that runs whether or not this replica
+// holds the leader lease.
 //
-// The certificate is read per handshake rather than cached, so a renewal
-// written into the mounted volume is picked up without a restart. cert-manager
-// rotates well before expiry, but a pod that cached the old pair would keep
-// serving it until something restarted it.
-//
-// The pair is also loaded once here so a bad or missing one fails startup,
-// rather than becoming a healthy-looking pod that fails every handshake.
-func servingTLSConfig(certFile, keyFile string) (*tls.Config, error) {
-	if _, err := tls.LoadX509KeyPair(certFile, keyFile); err != nil {
-		return nil, fmt.Errorf("load issuer serving certificate: %w", err)
-	}
-	return &tls.Config{
-		MinVersion: tls.VersionTLS12,
-		GetCertificate: func(*tls.ClientHelloInfo) (*tls.Certificate, error) {
-			certificate, err := tls.LoadX509KeyPair(certFile, keyFile)
-			if err != nil {
-				return nil, fmt.Errorf("load issuer serving certificate: %w", err)
-			}
-			return &certificate, nil
-		},
-	}, nil
+// A bare manager.RunnableFunc does not implement LeaderElectionRunnable, and
+// the manager's default for anything that does not is the leader-election
+// group. Serving read-only endpoints from the leader alone is wrong here: every
+// replica binds the port at startup and answers /readyz before the lease is
+// held, so a non-leader joins Service endpoints and then accepts connections it
+// never answers.
+type unconditionalRunnable func(context.Context) error
+
+func (r unconditionalRunnable) Start(ctx context.Context) error { return r(ctx) }
+
+// NeedLeaderElection puts this runnable in the manager's "others" group.
+func (r unconditionalRunnable) NeedLeaderElection() bool { return false }
+
+func everyReplica(run func(context.Context) error) manager.Runnable {
+	return unconditionalRunnable(run)
 }
 
 // serve runs server on listener until ctx is cancelled, then drains it.

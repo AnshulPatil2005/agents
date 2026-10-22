@@ -18,6 +18,7 @@ package agentidentity
 
 import (
 	"context"
+	"flag"
 	"fmt"
 	"reflect"
 	"time"
@@ -27,6 +28,7 @@ import (
 	"k8s.io/klog/v2"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	securityv1alpha1 "github.com/openkruise/agents/api/security/v1alpha1"
@@ -35,6 +37,18 @@ import (
 )
 
 var authConfigKind = securityv1alpha1.GroupVersion.WithKind("AgentAuthenticationConfig")
+
+// authConfigWorkers is how many AgentAuthenticationConfigs reconcile at once.
+//
+// Each reconcile makes an outbound request to somebody else's server, so a
+// single worker would serialise every namespace behind the slowest issuer. The
+// flag follows the pattern the other controllers in this repo use.
+var authConfigWorkers = 3
+
+func init() {
+	flag.IntVar(&authConfigWorkers, "authconfig-workers", authConfigWorkers,
+		"Max concurrent workers for the AgentAuthenticationConfig controller.")
+}
 
 // discoveryRetryBackoff is how long to wait before retrying an issuer that
 // could not be reached.
@@ -99,6 +113,14 @@ func (r *AuthConfigReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		return ctrl.Result{}, nil
 	}
 
+	// Discovery is an outbound request to somebody else's server, and the answer
+	// only changes when the spec does. Once this generation is resolved there is
+	// nothing to re-learn, so it is not fetched again and no resync is
+	// scheduled; an edit bumps the generation and arrives as an event.
+	if alreadyResolved(config) {
+		return ctrl.Result{}, nil
+	}
+
 	ready, resolved := r.resolve(ctx, config)
 
 	original := config.DeepCopy()
@@ -119,16 +141,35 @@ func (r *AuthConfigReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 			"ready", ready.Status, "reason", ready.Reason, "issuer", resolved.Issuer)
 	}
 
-	// A resolved issuer is re-checked on the shared resync so a rotated
-	// jwks_uri is picked up; a failure is retried sooner but still spaced.
+	// Success needs no requeue: alreadyResolved short-circuits the next
+	// reconcile, and a spec change arrives as an event.
 	if ready.Status == metav1.ConditionTrue {
-		return ctrl.Result{RequeueAfter: resyncInterval}, nil
+		return ctrl.Result{}, nil
 	}
 	if ready.Reason == reasonInvalidSpec {
 		// Retrying cannot help: only an edit can, and that produces an event.
 		return ctrl.Result{}, nil
 	}
+	// An unreachable issuer is usually an outage or a typo. Neither is fixed by
+	// retrying hard, so attempts are spaced.
 	return ctrl.Result{RequeueAfter: discoveryRetryBackoff}, nil
+}
+
+// alreadyResolved reports whether this generation has been resolved
+// successfully, so discovery can be skipped.
+//
+// Every part of the recorded state has to agree with the spec in front of us:
+// the status generation, the condition's own generation, a True status, and a
+// non-empty issuer. A mismatch in any of them means what is recorded describes
+// a different spec, or a failure, and discovery runs again.
+func alreadyResolved(config *securityv1alpha1.AgentAuthenticationConfig) bool {
+	if config.Status.ObservedGeneration != config.Generation || config.Status.Issuer == "" {
+		return false
+	}
+	ready := apiMeta.FindStatusCondition(config.Status.Conditions, securityv1alpha1.ConditionReady)
+	return ready != nil &&
+		ready.Status == metav1.ConditionTrue &&
+		ready.ObservedGeneration == config.Generation
 }
 
 // resolve builds the Ready condition and the values to record alongside it.
@@ -171,6 +212,7 @@ func (r *AuthConfigReconciler) resolve(ctx context.Context,
 
 func (r *AuthConfigReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
+		WithOptions(controller.Options{MaxConcurrentReconciles: authConfigWorkers}).
 		For(&securityv1alpha1.AgentAuthenticationConfig{}).
 		Complete(r)
 }

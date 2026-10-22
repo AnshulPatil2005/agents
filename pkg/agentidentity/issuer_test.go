@@ -17,7 +17,6 @@ limitations under the License.
 package agentidentity
 
 import (
-	"bytes"
 	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
@@ -35,6 +34,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"sigs.k8s.io/controller-runtime/pkg/manager"
 
 	"github.com/openkruise/agents/pkg/identity/jwtissuer"
 )
@@ -166,7 +167,7 @@ func TestAddIssuer(t *testing.T) {
 				TLSCertFile:    filepath.Join(t.TempDir(), "absent.crt"),
 				TLSKeyFile:     keyFile,
 			},
-			wantErr: "load issuer serving certificate",
+			wantErr: "watch issuer serving certificate",
 		},
 		{
 			name: "a full configuration enables issuance",
@@ -356,67 +357,6 @@ func fetchJSON(t *testing.T, client *http.Client, url string, into any) {
 	}
 }
 
-// TestServingCertificateIsReloadedPerHandshake covers the claim in
-// servingTLSConfig: a renewal written into the mounted volume must be picked up
-// without a restart. A config that cached the pair at startup would keep
-// serving the old certificate and pass every other test here.
-func TestServingCertificateIsReloadedPerHandshake(t *testing.T) {
-	certFile, keyFile := writeServingPair(t)
-
-	tlsConfig, err := servingTLSConfig(certFile, keyFile)
-	if err != nil {
-		t.Fatalf("servingTLSConfig: %v", err)
-	}
-
-	first, err := tlsConfig.GetCertificate(&tls.ClientHelloInfo{})
-	if err != nil {
-		t.Fatalf("first GetCertificate: %v", err)
-	}
-
-	// Simulate cert-manager rewriting the mounted files in place.
-	renewedCert, renewedKey := writeServingPair(t)
-	renewedCertPEM, err := os.ReadFile(renewedCert)
-	if err != nil {
-		t.Fatalf("read renewed certificate: %v", err)
-	}
-	renewedKeyPEM, err := os.ReadFile(renewedKey)
-	if err != nil {
-		t.Fatalf("read renewed key: %v", err)
-	}
-	if err := os.WriteFile(certFile, renewedCertPEM, 0o600); err != nil {
-		t.Fatalf("overwrite certificate: %v", err)
-	}
-	if err := os.WriteFile(keyFile, renewedKeyPEM, 0o600); err != nil {
-		t.Fatalf("overwrite key: %v", err)
-	}
-
-	second, err := tlsConfig.GetCertificate(&tls.ClientHelloInfo{})
-	if err != nil {
-		t.Fatalf("GetCertificate after renewal: %v", err)
-	}
-
-	if bytes.Equal(first.Certificate[0], second.Certificate[0]) {
-		t.Error("the renewed certificate was not picked up; the pair is being cached")
-	}
-}
-
-// TestServingCertificateErrorsAfterTheFilesGoAway covers the handshake-time
-// failure path, which is what a deleted or truncated Secret projection looks
-// like once the process is already running.
-func TestServingCertificateErrorsAfterTheFilesGoAway(t *testing.T) {
-	certFile, keyFile := writeServingPair(t)
-	tlsConfig, err := servingTLSConfig(certFile, keyFile)
-	if err != nil {
-		t.Fatalf("servingTLSConfig: %v", err)
-	}
-	if err := os.Remove(certFile); err != nil {
-		t.Fatalf("remove certificate: %v", err)
-	}
-	if _, err := tlsConfig.GetCertificate(&tls.ClientHelloInfo{}); err == nil {
-		t.Error("expected a handshake to fail once the certificate is gone")
-	}
-}
-
 // TestAddIssuerFailsOnAnOccupiedPort covers binding in AddIssuer rather than in
 // the Runnable: a port already in use must fail startup, not surface later from
 // a goroutine nobody is watching.
@@ -443,5 +383,36 @@ func TestAddIssuerFailsOnAnOccupiedPort(t *testing.T) {
 	}
 	if issuer != nil {
 		t.Error("a failed AddIssuer must not return an issuer")
+	}
+}
+
+// TestIssuerRunnablesRunOnEveryReplica covers the leader-election behaviour of
+// the registered runnables.
+//
+// A bare manager.RunnableFunc does not implement LeaderElectionRunnable, and
+// the manager's default for anything that does not is the leader-election
+// group. Since every replica binds the issuer port at startup and /readyz
+// answers before the lease is held, a leader-only server means a non-leader
+// joins Service endpoints and then accepts connections it never answers.
+func TestIssuerRunnablesRunOnEveryReplica(t *testing.T) {
+	runnable := everyReplica(func(context.Context) error { return nil })
+
+	elective, ok := runnable.(manager.LeaderElectionRunnable)
+	if !ok {
+		t.Fatal("the runnable must implement LeaderElectionRunnable, " +
+			"or the manager defaults it into the leader-election group")
+	}
+	if elective.NeedLeaderElection() {
+		t.Error("the issuer endpoints must serve from every replica, not only the leader")
+	}
+
+	// A bare RunnableFunc is what this exists to avoid: it does not implement
+	// the interface at all, which is how it ends up leader-only. If a future
+	// controller-runtime changes that, everyReplica stops being necessary and
+	// this says so rather than leaving the wrapper unexplained.
+	var bare manager.Runnable = manager.RunnableFunc(func(context.Context) error { return nil })
+	if _, implements := bare.(manager.LeaderElectionRunnable); implements {
+		t.Error("manager.RunnableFunc now implements LeaderElectionRunnable; " +
+			"re-check whether everyReplica is still needed")
 	}
 }

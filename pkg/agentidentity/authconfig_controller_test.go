@@ -95,7 +95,7 @@ func TestAuthConfigReconcile(t *testing.T) {
 			wantReason:  reasonDiscovered,
 			wantIssuer:  "https://keycloak.example.com/realms/agents",
 			wantJWKSURI: "https://keycloak.example.com/realms/agents/protocol/openid-connect/certs",
-			wantRequeue: resyncInterval,
+			wantRequeue: 0,
 		},
 		{
 			name:        "an unreachable issuer is reported and retried",
@@ -185,11 +185,16 @@ func TestAuthConfigReconcile(t *testing.T) {
 	}
 }
 
-// TestAuthConfigClearsStaleResolutionOnFailure covers the case that would
-// otherwise be misleading: a config that resolved once and later stops
-// resolving must not keep advertising the issuer it used to have, because a
-// consumer reading status alone would believe it is still usable.
-func TestAuthConfigClearsStaleResolutionOnFailure(t *testing.T) {
+// TestAuthConfigClearsResolutionWhenANewGenerationFails covers the case where a
+// stale resolution would actually be dangerous.
+//
+// Discovery runs once per generation, so a transient outage no longer re-opens
+// a settled answer: the issuer identity recorded for a generation is a fact
+// about that spec, not about whether the network is up. What must not survive
+// is an edit. If the spec is repointed and the new discoveryUrl does not
+// resolve, the previous issuer has to be cleared, or status would keep
+// advertising an issuer the current spec never named.
+func TestAuthConfigClearsResolutionWhenANewGenerationFails(t *testing.T) {
 	config := unresolvedConfig("keycloak", "https://keycloak.example.com/.well-known/openid-configuration")
 	fc := fake.NewClientBuilder().WithScheme(scheme).
 		WithStatusSubresource(&securityv1alpha1.AgentAuthenticationConfig{}).
@@ -210,20 +215,39 @@ func TestAuthConfigClearsStaleResolutionOnFailure(t *testing.T) {
 		t.Fatal("expected the issuer to be recorded on success")
 	}
 
+	// A settled generation is not re-resolved, so a failing discover changes
+	// nothing while the spec is unchanged.
 	broken := &AuthConfigReconciler{Client: fc, discover: failingDiscovery(errors.New("dns failure"))}
 	if _, err := broken.Reconcile(ctx, ctrl.Request{NamespacedName: key}); err != nil {
-		t.Fatalf("second Reconcile: %v", err)
+		t.Fatalf("reconcile on an unchanged generation: %v", err)
 	}
 	if err := fc.Get(ctx, key, got); err != nil {
-		t.Fatalf("get after failing: %v", err)
+		t.Fatalf("get: %v", err)
+	}
+	if got.Status.Issuer == "" {
+		t.Error("an outage must not discard a resolution that belongs to an unchanged spec")
+	}
+
+	// The spec is now repointed somewhere that does not resolve.
+	got.Spec.JWT.DiscoveryURL = "https://elsewhere.example/.well-known/openid-configuration"
+	got.Generation = 2
+	if err := fc.Update(ctx, got); err != nil {
+		t.Fatalf("update the spec: %v", err)
+	}
+	if _, err := broken.Reconcile(ctx, ctrl.Request{NamespacedName: key}); err != nil {
+		t.Fatalf("reconcile on the new generation: %v", err)
+	}
+
+	if err := fc.Get(ctx, key, got); err != nil {
+		t.Fatalf("get after the failed generation: %v", err)
 	}
 	if got.Status.Issuer != "" || got.Status.JWKSURI != "" {
-		t.Errorf("stale resolution survived a failure: issuer=%q jwksUri=%q",
+		t.Errorf("a resolution from the previous spec survived: issuer=%q jwksUri=%q",
 			got.Status.Issuer, got.Status.JWKSURI)
 	}
 	if c := apiMeta.FindStatusCondition(got.Status.Conditions, securityv1alpha1.ConditionReady); c == nil ||
 		c.Status != metav1.ConditionFalse {
-		t.Errorf("expected Ready=False after the failure, got %+v", c)
+		t.Errorf("expected Ready=False for the unresolvable generation, got %+v", c)
 	}
 }
 
@@ -290,5 +314,53 @@ func TestAuthConfigSetupWithManager(t *testing.T) {
 	r := &AuthConfigReconciler{Client: mgr.GetClient(), discover: oidc.Discover}
 	if err := r.SetupWithManager(mgr); err != nil {
 		t.Fatalf("SetupWithManager: %v", err)
+	}
+}
+
+// TestAuthConfigResolvesOncePerGeneration counts the outbound requests.
+// Discovery reaches somebody else's server, so a settled generation must not
+// keep fetching, and an edit must.
+func TestAuthConfigResolvesOncePerGeneration(t *testing.T) {
+	config := unresolvedConfig("keycloak", "https://keycloak.example.com/.well-known/openid-configuration")
+	fc := fake.NewClientBuilder().WithScheme(scheme).
+		WithStatusSubresource(&securityv1alpha1.AgentAuthenticationConfig{}).
+		WithObjects(config.DeepCopy()).Build()
+	key := client.ObjectKeyFromObject(config)
+	ctx := context.Background()
+
+	var fetches int
+	r := &AuthConfigReconciler{Client: fc,
+		discover: func(context.Context, string, oidc.Options) (oidc.Discovered, error) {
+			fetches++
+			return oidc.Discovered{
+				Issuer:  "https://keycloak.example.com",
+				JWKSURI: "https://keycloak.example.com/keys",
+			}, nil
+		}}
+
+	for i := 0; i < 4; i++ {
+		if _, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: key}); err != nil {
+			t.Fatalf("reconcile %d: %v", i, err)
+		}
+	}
+	if fetches != 1 {
+		t.Errorf("an unchanged generation fetched discovery %d times, want 1", fetches)
+	}
+
+	// An edit bumps the generation, which has to resolve again.
+	got := &securityv1alpha1.AgentAuthenticationConfig{}
+	if err := fc.Get(ctx, key, got); err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	got.Generation = 2
+	got.Spec.JWT.AllowedAudience = []string{"another-agent"}
+	if err := fc.Update(ctx, got); err != nil {
+		t.Fatalf("update: %v", err)
+	}
+	if _, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: key}); err != nil {
+		t.Fatalf("reconcile after the edit: %v", err)
+	}
+	if fetches != 2 {
+		t.Errorf("a changed generation fetched discovery %d times total, want 2", fetches)
 	}
 }
