@@ -353,6 +353,49 @@ func TestContextPartsAreUnambiguous(t *testing.T) {
 	}
 }
 
+// TestKeyringOwnsItsKeyMaterial covers the keyring keeping a copy rather than a
+// reference to the caller's key material.
+//
+// Wiping a key buffer once it has been handed over is the careful thing for a
+// caller to do. If the keyring aliased that buffer, doing so would turn every
+// later Seal and Open into an authentication failure, with nothing in the error
+// to suggest the key had been zeroed underneath.
+func TestKeyringOwnsItsKeyMaterial(t *testing.T) {
+	secret := bytes.Repeat([]byte{0x11}, KeySize)
+	keyring, err := NewKeyring(Key{ID: "2026-10", Secret: secret})
+	if err != nil {
+		t.Fatalf("NewKeyring: %v", err)
+	}
+
+	stored, err := keyring.Seal([]byte("token"), "team-a")
+	if err != nil {
+		t.Fatalf("Seal: %v", err)
+	}
+
+	for i := range secret {
+		secret[i] = 0
+	}
+
+	// Sealing has to keep working too: the active key is held separately from
+	// the lookup map, so a copy in one and a reference in the other would pass
+	// an Open-only check.
+	resealed, err := keyring.Seal([]byte("token"), "team-a")
+	if err != nil {
+		t.Fatalf("Seal after the caller wiped its key: %v", err)
+	}
+	if _, err := keyring.Open(resealed, "team-a"); err != nil {
+		t.Fatalf("Open a record sealed after the caller wiped its key: %v", err)
+	}
+
+	opened, err := keyring.Open(stored, "team-a")
+	if err != nil {
+		t.Fatalf("Open after the caller wiped its key: %v", err)
+	}
+	if string(opened) != "token" {
+		t.Errorf("Open returned %q, want %q", opened, "token")
+	}
+}
+
 func TestNewKeyringRejectsBadKeys(t *testing.T) {
 	good := mustKey(t, "2026-10")
 

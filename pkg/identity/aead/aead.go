@@ -31,6 +31,7 @@ limitations under the License.
 package aead
 
 import (
+	"bytes"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
@@ -134,7 +135,16 @@ func (r *Keyring) add(key Key) error {
 	if _, exists := r.byID[key.ID]; exists {
 		return errors.New("key ID is already present in the keyring")
 	}
-	r.byID[key.ID] = key
+	// The material is copied so the keyring owns it. A caller holding the only
+	// other reference is entitled to wipe its own buffer once the keyring is
+	// built, which is the careful thing to do with key material, and if the
+	// keyring aliased it that would turn every later Seal and Open into an
+	// authentication failure with nothing to point at.
+	owned := Key{ID: key.ID, Secret: bytes.Clone(key.Secret)}
+	r.byID[key.ID] = owned
+	if key.ID == r.active.ID {
+		r.active = owned
+	}
 	return nil
 }
 
@@ -162,6 +172,11 @@ func (r *Keyring) Seal(plaintext []byte, context ...string) ([]byte, error) {
 	// integrity on reuse, not just the one message, so this is read from the
 	// system CSPRNG and a failure is fatal to the call rather than retried with
 	// anything weaker.
+	//
+	// Random 96-bit nonces carry a birthday bound rather than a hard guarantee,
+	// which NIST SP 800-38D puts at 2^32 seals under one key. Nothing here
+	// counts invocations, so that ceiling is a reason to rotate on a schedule
+	// and not only in response to a suspected compromise.
 	nonce := make([]byte, gcm.NonceSize())
 	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
 		return nil, fmt.Errorf("aead: read nonce: %w", err)
