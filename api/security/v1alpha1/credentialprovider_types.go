@@ -121,6 +121,13 @@ type OAuth2UserFederation struct {
 }
 
 // OAuth2Provider is the OAuth2 half of a CredentialProvider spec.
+//
+// The CEL rule pairs the grant type with its configuration block. userFederation
+// is the only grant type, so without the rule every provider could be created
+// without the block describing the flow it says it uses, and the omission would
+// only surface the first time an agent needed a credential.
+//
+// +kubebuilder:validation:XValidation:rule="self.grantType != 'userFederation' || has(self.userFederation)",message="userFederation is required when grantType is userFederation"
 type OAuth2Provider struct {
 	// GrantType selects the flow. The only supported value is "userFederation":
 	// a user approving an agent's access to their own account.
@@ -144,10 +151,11 @@ type OAuth2Provider struct {
 
 // CredentialProviderSpec declares a third-party OAuth client.
 //
-// The CEL rule pairs the grant type with its configuration block. Admission is
-// where that belongs: a provider missing the block for its own grant type
-// cannot serve a single request, and failing at creation is better than failing
-// the first time an agent needs a credential.
+// The CEL rule pairs the credential type with its configuration block, the same
+// way OAuth2Provider pairs the grant type with its own. Admission is where that
+// belongs: a provider missing the block for the mechanism it declares cannot
+// serve a single request, and failing at creation is better than failing the
+// first time an agent needs a credential.
 //
 // +kubebuilder:validation:XValidation:rule="self.type != 'oauth2' || has(self.oauth2)",message="oauth2 is required when type is oauth2"
 type CredentialProviderSpec struct {
