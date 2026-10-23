@@ -113,39 +113,50 @@ type record struct {
 // NewKeyring returns a Keyring that seals under active and opens under active
 // or any retained key.
 func NewKeyring(active Key, retained ...Key) (*Keyring, error) {
-	keyring := &Keyring{active: active, byID: make(map[string]Key, 1+len(retained))}
-	if err := keyring.add(active); err != nil {
+	keyring := &Keyring{byID: make(map[string]Key, 1+len(retained))}
+
+	owned, err := keyring.add(active)
+	if err != nil {
 		return nil, fmt.Errorf("active key: %w", err)
 	}
+	// Assigned from what add stored rather than from the argument. The active
+	// key is held separately from the lookup map, so taking it from the
+	// argument would leave it aliasing the caller's slice while the map held a
+	// copy, and sealing would break on a wipe that opening survived.
+	keyring.active = owned
+
 	for _, key := range retained {
-		if err := keyring.add(key); err != nil {
+		if _, err := keyring.add(key); err != nil {
 			return nil, fmt.Errorf("retained key %q: %w", key.ID, err)
 		}
 	}
 	return keyring, nil
 }
 
-func (r *Keyring) add(key Key) error {
+// add validates key, stores a copy of it, and returns the copy it stored.
+//
+// The material is copied so the keyring owns it. A caller holding the only
+// other reference is entitled to wipe its own buffer once the keyring is built,
+// which is the careful thing to do with key material, and if the keyring
+// aliased it that would turn every later Seal and Open into an authentication
+// failure with nothing to point at.
+//
+// The copy is returned rather than only stored so a caller that needs to hold
+// the key elsewhere takes it from here, instead of from an argument that the
+// keyring does not own.
+func (r *Keyring) add(key Key) (Key, error) {
 	if key.ID == "" {
-		return errors.New("key ID must not be empty")
+		return Key{}, errors.New("key ID must not be empty")
 	}
 	if len(key.Secret) != KeySize {
-		return fmt.Errorf("key must be %d bytes, got %d", KeySize, len(key.Secret))
+		return Key{}, fmt.Errorf("key must be %d bytes, got %d", KeySize, len(key.Secret))
 	}
 	if _, exists := r.byID[key.ID]; exists {
-		return errors.New("key ID is already present in the keyring")
+		return Key{}, errors.New("key ID is already present in the keyring")
 	}
-	// The material is copied so the keyring owns it. A caller holding the only
-	// other reference is entitled to wipe its own buffer once the keyring is
-	// built, which is the careful thing to do with key material, and if the
-	// keyring aliased it that would turn every later Seal and Open into an
-	// authentication failure with nothing to point at.
 	owned := Key{ID: key.ID, Secret: bytes.Clone(key.Secret)}
 	r.byID[key.ID] = owned
-	if key.ID == r.active.ID {
-		r.active = owned
-	}
-	return nil
+	return owned, nil
 }
 
 // ActiveKeyID is the key new records are sealed under. Useful for deciding
